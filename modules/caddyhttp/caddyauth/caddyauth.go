@@ -18,9 +18,11 @@ import (
 	"fmt"
 	"net/http"
 
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -75,9 +77,9 @@ func (a Authentication) ServeHTTP(w http.ResponseWriter, r *http.Request, next c
 	for provName, prov := range a.Providers {
 		user, authed, err = prov.Authenticate(w, r)
 		if err != nil {
-			a.logger.Error("auth provider returned error",
-				zap.String("provider", provName),
-				zap.Error(err))
+			if c := a.logger.Check(zapcore.ErrorLevel, "auth provider returned error"); c != nil {
+				c.Write(zap.String("provider", provName), zap.Error(err))
+			}
 			continue
 		}
 		if authed {

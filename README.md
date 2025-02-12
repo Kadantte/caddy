@@ -56,7 +56,7 @@
 </p>
 
 
-## [Features](https://caddyserver.com/v2)
+## [Features](https://caddyserver.com/features)
 
 - **Easy configuration** with the [Caddyfile](https://caddyserver.com/docs/caddyfile)
 - **Powerful configuration** with its [native JSON config](https://caddyserver.com/docs/json/)
@@ -75,7 +75,7 @@
 - **Runs anywhere** with **no external dependencies** (not even libc)
 - Written in Go, a language with higher **memory safety guarantees** than other servers
 - Actually **fun to use**
-- So much more to [discover](https://caddyserver.com/v2)
+- So much more to [discover](https://caddyserver.com/features)
 
 ## Install
 
@@ -87,7 +87,7 @@ See [our online documentation](https://caddyserver.com/docs/install) for other i
 
 Requirements:
 
-- [Go 1.19 or newer](https://golang.org/dl/)
+- [Go 1.22.3 or newer](https://golang.org/dl/)
 
 ### For development
 
@@ -131,7 +131,7 @@ $ xcaddy build
 4. Initialize a Go module: `go mod init caddy`
 5. (Optional) Pin Caddy version: `go get github.com/caddyserver/caddy/v2@version` replacing `version` with a git tag, commit, or branch name.
 6. (Optional) Add plugins by adding their import: `_ "import/path/here"`
-7. Compile: `go build`
+7. Compile: `go build -tags=nobadger,nomysql,nopgx`
 
 
 
@@ -176,7 +176,7 @@ The docs are also open source. You can contribute to them here: https://github.c
 
 ## Getting help
 
-- We advise companies using Caddy to secure a support contract through [Ardan Labs](https://www.ardanlabs.com/my/contact-us?dd=caddy) before help is needed.
+- We advise companies using Caddy to secure a support contract through [Ardan Labs](https://www.ardanlabs.com) before help is needed.
 
 - A [sponsorship](https://github.com/sponsors/mholt) goes a long way! We can offer private help to sponsors. If Caddy is benefitting your company, please consider a sponsorship. This not only helps fund full-time work to ensure the longevity of the project, it provides your company the resources, support, and discounts you need; along with being a great look for your company to your customers and potential customers!
 

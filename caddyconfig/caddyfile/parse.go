@@ -22,8 +22,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/caddyserver/caddy/v2"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
 )
 
 // Parse parses the input just enough to group tokens, in
@@ -49,7 +50,7 @@ func Parse(filename string, input []byte) ([]ServerBlock, error) {
 	p := parser{
 		Dispenser: NewDispenser(tokens),
 		importGraph: importGraph{
-			nodes: make(map[string]bool),
+			nodes: make(map[string]struct{}),
 			edges: make(adjacency),
 		},
 	}
@@ -148,7 +149,6 @@ func (p *parser) begin() error {
 	}
 
 	err := p.addresses()
-
 	if err != nil {
 		return err
 	}
@@ -156,6 +156,25 @@ func (p *parser) begin() error {
 	if p.eof {
 		// this happens if the Caddyfile consists of only
 		// a line of addresses and nothing else
+		return nil
+	}
+
+	if ok, name := p.isNamedRoute(); ok {
+		// we just need a dummy leading token to ease parsing later
+		nameToken := p.Token()
+		nameToken.Text = name
+
+		// named routes only have one key, the route name
+		p.block.Keys = []Token{nameToken}
+		p.block.IsNamedRoute = true
+
+		// get all the tokens from the block, including the braces
+		tokens, err := p.blockTokens(true)
+		if err != nil {
+			return err
+		}
+		tokens = append([]Token{nameToken}, tokens...)
+		p.block.Segments = []Segment{tokens}
 		return nil
 	}
 
@@ -167,7 +186,7 @@ func (p *parser) begin() error {
 			return p.Errf("redeclaration of previously declared snippet %s", name)
 		}
 		// consume all tokens til matched close brace
-		tokens, err := p.snippetTokens()
+		tokens, err := p.blockTokens(false)
 		if err != nil {
 			return err
 		}
@@ -192,11 +211,17 @@ func (p *parser) addresses() error {
 	var expectingAnother bool
 
 	for {
-		tkn := p.Val()
+		value := p.Val()
+		token := p.Token()
 
-		// special case: import directive replaces tokens during parse-time
-		if tkn == "import" && p.isNewLine() {
-			err := p.doImport()
+		// Reject request matchers if trying to define them globally
+		if strings.HasPrefix(value, "@") {
+			return p.Errf("request matchers may not be defined globally, they must be in a site block; found %s", value)
+		}
+
+		// Special case: import directive replaces tokens during parse-time
+		if value == "import" && p.isNewLine() {
+			err := p.doImport(0)
 			if err != nil {
 				return err
 			}
@@ -204,9 +229,9 @@ func (p *parser) addresses() error {
 		}
 
 		// Open brace definitely indicates end of addresses
-		if tkn == "{" {
+		if value == "{" {
 			if expectingAnother {
-				return p.Errf("Expected another address but had '%s' - check for extra comma", tkn)
+				return p.Errf("Expected another address but had '%s' - check for extra comma", value)
 			}
 			// Mark this server block as being defined with braces.
 			// This is used to provide a better error message when
@@ -218,15 +243,15 @@ func (p *parser) addresses() error {
 		}
 
 		// Users commonly forget to place a space between the address and the '{'
-		if strings.HasSuffix(tkn, "{") {
-			return p.Errf("Site addresses cannot end with a curly brace: '%s' - put a space between the token and the brace", tkn)
+		if strings.HasSuffix(value, "{") {
+			return p.Errf("Site addresses cannot end with a curly brace: '%s' - put a space between the token and the brace", value)
 		}
 
-		if tkn != "" { // empty token possible if user typed ""
+		if value != "" { // empty token possible if user typed ""
 			// Trailing comma indicates another address will follow, which
 			// may possibly be on the next line
-			if tkn[len(tkn)-1] == ',' {
-				tkn = tkn[:len(tkn)-1]
+			if value[len(value)-1] == ',' {
+				value = value[:len(value)-1]
 				expectingAnother = true
 			} else {
 				expectingAnother = false // but we may still see another one on this line
@@ -235,11 +260,17 @@ func (p *parser) addresses() error {
 			// If there's a comma here, it's probably because they didn't use a space
 			// between their two domains, e.g. "foo.com,bar.com", which would not be
 			// parsed as two separate site addresses.
-			if strings.Contains(tkn, ",") {
-				return p.Errf("Site addresses cannot contain a comma ',': '%s' - put a space after the comma to separate site addresses", tkn)
+			if strings.Contains(value, ",") {
+				return p.Errf("Site addresses cannot contain a comma ',': '%s' - put a space after the comma to separate site addresses", value)
 			}
 
-			p.block.Keys = append(p.block.Keys, tkn)
+			// After the above, a comma surrounded by spaces would result
+			// in an empty token which we should ignore
+			if value != "" {
+				// Add the token as a site address
+				token.Text = value
+				p.block.Keys = append(p.block.Keys, token)
+			}
 		}
 
 		// Advance token and possibly break out of loop or return error
@@ -296,7 +327,7 @@ func (p *parser) directives() error {
 
 		// special case: import directive replaces tokens during parse-time
 		if p.Val() == "import" {
-			err := p.doImport()
+			err := p.doImport(1)
 			if err != nil {
 				return err
 			}
@@ -322,7 +353,7 @@ func (p *parser) directives() error {
 // is on the token before where the import directive was. In
 // other words, call Next() to access the first token that was
 // imported.
-func (p *parser) doImport() error {
+func (p *parser) doImport(nesting int) error {
 	// syntax checks
 	if !p.NextArg() {
 		return p.ArgErr()
@@ -338,9 +369,45 @@ func (p *parser) doImport() error {
 	// set up a replacer for non-variadic args replacement
 	repl := makeArgsReplacer(args)
 
+	// grab all the tokens (if it exists) from within a block that follows the import
+	var blockTokens []Token
+	for currentNesting := p.Nesting(); p.NextBlock(currentNesting); {
+		blockTokens = append(blockTokens, p.Token())
+	}
+	// initialize with size 1
+	blockMapping := make(map[string][]Token, 1)
+	if len(blockTokens) > 0 {
+		// use such tokens to create a new dispenser, and then use it to parse each block
+		bd := NewDispenser(blockTokens)
+		for bd.Next() {
+			// see if we can grab a key
+			var currentMappingKey string
+			if bd.Val() == "{" {
+				return p.Err("anonymous blocks are not supported")
+			}
+			currentMappingKey = bd.Val()
+			currentMappingTokens := []Token{}
+			// read all args until end of line / {
+			if bd.NextArg() {
+				currentMappingTokens = append(currentMappingTokens, bd.Token())
+				for bd.NextArg() {
+					currentMappingTokens = append(currentMappingTokens, bd.Token())
+				}
+				// TODO(elee1766): we don't enter another mapping here because it's annoying to extract the { and } properly.
+				// maybe someone can do that in the future
+			} else {
+				// attempt to enter a block and add tokens to the currentMappingTokens
+				for mappingNesting := bd.Nesting(); bd.NextBlock(mappingNesting); {
+					currentMappingTokens = append(currentMappingTokens, bd.Token())
+				}
+			}
+			blockMapping[currentMappingKey] = currentMappingTokens
+		}
+	}
+
 	// splice out the import directive and its arguments
 	// (2 tokens, plus the length of args)
-	tokensBefore := p.tokens[:p.cursor-1-len(args)]
+	tokensBefore := p.tokens[:p.cursor-1-len(args)-len(blockTokens)]
 	tokensAfter := p.tokens[p.cursor+1:]
 	var importedTokens []Token
 	var nodes []string
@@ -356,7 +423,7 @@ func (p *parser) doImport() error {
 		// make path relative to the file of the _token_ being processed rather
 		// than current working directory (issue #867) and then use glob to get
 		// list of matching filenames
-		absFile, err := filepath.Abs(p.Dispenser.File())
+		absFile, err := caddy.FastAbs(p.Dispenser.File())
 		if err != nil {
 			return p.Errf("Failed to get absolute path of file: %s: %v", p.Dispenser.File(), err)
 		}
@@ -374,7 +441,6 @@ func (p *parser) doImport() error {
 			return p.Errf("Glob pattern may only contain one wildcard (*), but has others: %s", globPattern)
 		}
 		matches, err = filepath.Glob(globPattern)
-
 		if err != nil {
 			return p.Errf("Failed to use import pattern %s: %v", importPattern, err)
 		}
@@ -411,7 +477,7 @@ func (p *parser) doImport() error {
 		nodes = matches
 	}
 
-	nodeName := p.Token().originalFile()
+	nodeName := p.File()
 	if p.Token().snippetName != "" {
 		nodeName += fmt.Sprintf(":%s", p.Token().snippetName)
 	}
@@ -425,15 +491,82 @@ func (p *parser) doImport() error {
 	// copy the tokens so we don't overwrite p.definedSnippets
 	tokensCopy := make([]Token, 0, len(importedTokens))
 
+	var (
+		maybeSnippet   bool
+		maybeSnippetId bool
+		index          int
+	)
+
 	// run the argument replacer on the tokens
 	// golang for range slice return a copy of value
 	// similarly, append also copy value
-	for _, token := range importedTokens {
-		// set the token's file to refer to import directive line number and snippet name
+	for i, token := range importedTokens {
+		// update the token's imports to refer to import directive filename, line number and snippet name if there is one
 		if token.snippetName != "" {
-			token.updateFile(fmt.Sprintf("%s:%d (import %s)", token.File, p.Line(), token.snippetName))
+			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import %s)", p.File(), p.Line(), token.snippetName))
 		} else {
-			token.updateFile(fmt.Sprintf("%s:%d (import)", token.File, p.Line()))
+			token.imports = append(token.imports, fmt.Sprintf("%s:%d (import)", p.File(), p.Line()))
+		}
+
+		// naive way of determine snippets, as snippets definition can only follow name + block
+		// format, won't check for nesting correctness or any other error, that's what parser does.
+		if !maybeSnippet && nesting == 0 {
+			// first of the line
+			if i == 0 || isNextOnNewLine(tokensCopy[i-1], token) {
+				index = 0
+			} else {
+				index++
+			}
+
+			if index == 0 && len(token.Text) >= 3 && strings.HasPrefix(token.Text, "(") && strings.HasSuffix(token.Text, ")") {
+				maybeSnippetId = true
+			}
+		}
+
+		switch token.Text {
+		case "{":
+			nesting++
+			if index == 1 && maybeSnippetId && nesting == 1 {
+				maybeSnippet = true
+				maybeSnippetId = false
+			}
+		case "}":
+			nesting--
+			if nesting == 0 && maybeSnippet {
+				maybeSnippet = false
+			}
+		}
+		// if it is {block}, we substitute with all tokens in the block
+		// if it is {blocks.*}, we substitute with the tokens in the mapping for the *
+		var skip bool
+		var tokensToAdd []Token
+		switch {
+		case token.Text == "{block}":
+			tokensToAdd = blockTokens
+		case strings.HasPrefix(token.Text, "{blocks.") && strings.HasSuffix(token.Text, "}"):
+			// {blocks.foo.bar} will be extracted to key `foo.bar`
+			blockKey := strings.TrimPrefix(strings.TrimSuffix(token.Text, "}"), "{blocks.")
+			val, ok := blockMapping[blockKey]
+			if ok {
+				tokensToAdd = val
+			}
+		default:
+			skip = true
+		}
+		if !skip {
+			if len(tokensToAdd) == 0 {
+				// if there is no content in the snippet block, don't do any replacement
+				// this allows snippets which contained {block}/{block.*} before this change to continue functioning as normal
+				tokensCopy = append(tokensCopy, token)
+			} else {
+				tokensCopy = append(tokensCopy, tokensToAdd...)
+			}
+			continue
+		}
+
+		if maybeSnippet {
+			tokensCopy = append(tokensCopy, token)
+			continue
 		}
 
 		foundVariadic, startIndex, endIndex := parseVariadic(token, len(args))
@@ -451,7 +584,7 @@ func (p *parser) doImport() error {
 	// splice the imported tokens in the place of the import statement
 	// and rewind cursor so Next() will land on first imported token
 	p.tokens = append(tokensBefore, append(tokensCopy, tokensAfter...)...)
-	p.cursor -= len(args) + 1
+	p.cursor -= len(args) + len(blockTokens) + 1
 
 	return nil
 }
@@ -489,7 +622,7 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 
 	// Tack the file path onto these tokens so errors show the imported file's name
 	// (we use full, absolute path to avoid bugs: issue #1892)
-	filename, err := filepath.Abs(importFile)
+	filename, err := caddy.FastAbs(importFile)
 	if err != nil {
 		return nil, p.Errf("Failed to get absolute path of file: %s: %v", importFile, err)
 	}
@@ -507,7 +640,6 @@ func (p *parser) doSingleImport(importFile string) ([]Token, error) {
 // are loaded into the current server block for later use
 // by directive setup functions.
 func (p *parser) directive() error {
-
 	// a segment is a list of tokens associated with this directive
 	var segment Segment
 
@@ -519,6 +651,9 @@ func (p *parser) directive() error {
 			p.nesting++
 			if !p.isNextOnNewLine() && p.Token().wasQuoted == 0 {
 				return p.Err("Unexpected next token after '{' on same line")
+			}
+			if p.isNewLine() {
+				return p.Err("Unexpected '{' on a new line; did you mean to place the '{' on the previous line?")
 			}
 		} else if p.Val() == "{}" {
 			if p.isNextOnNewLine() && p.Token().wasQuoted == 0 {
@@ -532,7 +667,7 @@ func (p *parser) directive() error {
 		} else if p.Val() == "}" && p.nesting == 0 {
 			return p.Err("Unexpected '}' because no matching opening brace")
 		} else if p.Val() == "import" && p.isNewLine() {
-			if err := p.doImport(); err != nil {
+			if err := p.doImport(1); err != nil {
 				return err
 			}
 			p.cursor-- // cursor is advanced when we continue, so roll back one more
@@ -573,28 +708,43 @@ func (p *parser) closeCurlyBrace() error {
 	return nil
 }
 
+func (p *parser) isNamedRoute() (bool, string) {
+	keys := p.block.Keys
+	// A named route block is a single key with parens, prefixed with &.
+	if len(keys) == 1 && strings.HasPrefix(keys[0].Text, "&(") && strings.HasSuffix(keys[0].Text, ")") {
+		return true, strings.TrimSuffix(keys[0].Text[2:], ")")
+	}
+	return false, ""
+}
+
 func (p *parser) isSnippet() (bool, string) {
 	keys := p.block.Keys
 	// A snippet block is a single key with parens. Nothing else qualifies.
-	if len(keys) == 1 && strings.HasPrefix(keys[0], "(") && strings.HasSuffix(keys[0], ")") {
-		return true, strings.TrimSuffix(keys[0][1:], ")")
+	if len(keys) == 1 && strings.HasPrefix(keys[0].Text, "(") && strings.HasSuffix(keys[0].Text, ")") {
+		return true, strings.TrimSuffix(keys[0].Text[1:], ")")
 	}
 	return false, ""
 }
 
 // read and store everything in a block for later replay.
-func (p *parser) snippetTokens() ([]Token, error) {
-	// snippet must have curlies.
+func (p *parser) blockTokens(retainCurlies bool) ([]Token, error) {
+	// block must have curlies.
 	err := p.openCurlyBrace()
 	if err != nil {
 		return nil, err
 	}
-	nesting := 1 // count our own nesting in snippets
+	nesting := 1 // count our own nesting
 	tokens := []Token{}
+	if retainCurlies {
+		tokens = append(tokens, p.Token())
+	}
 	for p.Next() {
 		if p.Val() == "}" {
 			nesting--
 			if nesting == 0 {
+				if retainCurlies {
+					tokens = append(tokens, p.Token())
+				}
 				break
 			}
 		}
@@ -614,9 +764,18 @@ func (p *parser) snippetTokens() ([]Token, error) {
 // head of the server block with tokens, which are
 // grouped by segments.
 type ServerBlock struct {
-	HasBraces bool
-	Keys      []string
-	Segments  []Segment
+	HasBraces    bool
+	Keys         []Token
+	Segments     []Segment
+	IsNamedRoute bool
+}
+
+func (sb ServerBlock) GetKeysText() []string {
+	res := []string{}
+	for _, k := range sb.Keys {
+		res = append(res, k.Text)
+	}
+	return res
 }
 
 // DispenseDirective returns a dispenser that contains

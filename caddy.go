@@ -22,6 +22,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -34,10 +35,12 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/notify"
 	"github.com/caddyserver/certmagic"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2/internal/filesystems"
+	"github.com/caddyserver/caddy/v2/notify"
 )
 
 // Config is the top (or beginning) of the Caddy configuration structure.
@@ -82,6 +85,9 @@ type Config struct {
 	storage certmagic.Storage
 
 	cancelFunc context.CancelFunc
+
+	// filesystems is a dict of filesystems that will later be loaded from and added to.
+	filesystems FileSystems
 }
 
 // App is a thing that Caddy runs.
@@ -156,8 +162,8 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 		return fmt.Errorf("method not allowed")
 	}
 
-	currentCtxMu.Lock()
-	defer currentCtxMu.Unlock()
+	rawCfgMu.Lock()
+	defer rawCfgMu.Unlock()
 
 	if ifMatchHeader != "" {
 		// expect the first and last character to be quotes
@@ -257,8 +263,8 @@ func changeConfig(method, path string, input []byte, ifMatchHeader string, force
 // readConfig traverses the current config to path
 // and writes its JSON encoding to out.
 func readConfig(path string, out io.Writer) error {
-	currentCtxMu.RLock()
-	defer currentCtxMu.RUnlock()
+	rawCfgMu.RLock()
+	defer rawCfgMu.RUnlock()
 	return unsyncedConfigAccess(http.MethodGet, path, nil, out)
 }
 
@@ -305,7 +311,7 @@ func indexConfigObjects(ptr any, configPath string, index map[string]string) err
 // it as the new config, replacing any other current config.
 // It does NOT update the raw config state, as this is a
 // lower-level function; most callers will want to use Load
-// instead. A write lock on currentCtxMu is required! If
+// instead. A write lock on rawCfgMu is required! If
 // allowPersist is false, it will not be persisted to disk,
 // even if it is configured to.
 func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
@@ -340,8 +346,10 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 	}
 
 	// swap old context (including its config) with the new one
+	currentCtxMu.Lock()
 	oldCtx := currentCtx
 	currentCtx = ctx
+	currentCtxMu.Unlock()
 
 	// Stop, Cleanup each old app
 	unsyncedStop(oldCtx)
@@ -354,13 +362,13 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 			newCfg.Admin.Config.Persist == nil ||
 			*newCfg.Admin.Config.Persist) {
 		dir := filepath.Dir(ConfigAutosavePath)
-		err := os.MkdirAll(dir, 0700)
+		err := os.MkdirAll(dir, 0o700)
 		if err != nil {
 			Log().Error("unable to create folder for config autosave",
 				zap.String("dir", dir),
 				zap.Error(err))
 		} else {
-			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0600)
+			err := os.WriteFile(ConfigAutosavePath, cfgJSON, 0o600)
 			if err == nil {
 				Log().Info("autosaved config (load with --resume flag)", zap.String("file", ConfigAutosavePath))
 			} else {
@@ -389,6 +397,62 @@ func unsyncedDecodeAndRun(cfgJSON []byte, allowPersist bool) error {
 // will want to use Run instead, which also
 // updates the config's raw state.
 func run(newCfg *Config, start bool) (Context, error) {
+	ctx, err := provisionContext(newCfg, start)
+	if err != nil {
+		globalMetrics.configSuccess.Set(0)
+		return ctx, err
+	}
+
+	if !start {
+		return ctx, nil
+	}
+
+	// Provision any admin routers which may need to access
+	// some of the other apps at runtime
+	err = ctx.cfg.Admin.provisionAdminRouters(ctx)
+	if err != nil {
+		globalMetrics.configSuccess.Set(0)
+		return ctx, err
+	}
+
+	// Start
+	err = func() error {
+		started := make([]string, 0, len(ctx.cfg.apps))
+		for name, a := range ctx.cfg.apps {
+			err := a.Start()
+			if err != nil {
+				// an app failed to start, so we need to stop
+				// all other apps that were already started
+				for _, otherAppName := range started {
+					err2 := ctx.cfg.apps[otherAppName].Stop()
+					if err2 != nil {
+						err = fmt.Errorf("%v; additionally, aborting app %s: %v",
+							err, otherAppName, err2)
+					}
+				}
+				return fmt.Errorf("%s app module: start: %v", name, err)
+			}
+			started = append(started, name)
+		}
+		return nil
+	}()
+	if err != nil {
+		globalMetrics.configSuccess.Set(0)
+		return ctx, err
+	}
+	globalMetrics.configSuccess.Set(1)
+	globalMetrics.configSuccessTime.SetToCurrentTime()
+	// now that the user's config is running, finish setting up anything else,
+	// such as remote admin endpoint, config loader, etc.
+	return ctx, finishSettingUp(ctx, ctx.cfg)
+}
+
+// provisionContext creates a new context from the given configuration and provisions
+// storage and apps.
+// If `newCfg` is nil a new empty configuration will be created.
+// If `replaceAdminServer` is true any currently active admin server will be replaced
+// with a new admin server based on the provided configuration.
+func provisionContext(newCfg *Config, replaceAdminServer bool) (Context, error) {
 	// because we will need to roll back any state
 	// modifications if this function errors, we
 	// keep a single error value and scope all
@@ -411,6 +475,7 @@ func run(newCfg *Config, start bool) (Context, error) {
 	ctx, cancel := NewContext(Context{Context: context.Background(), cfg: newCfg})
 	defer func() {
 		if err != nil {
+			globalMetrics.configSuccess.Set(0)
 			// if there were any errors during startup,
 			// we should cancel the new context we created
 			// since the associated config won't be used;
@@ -436,12 +501,15 @@ func run(newCfg *Config, start bool) (Context, error) {
 	}
 
 	// start the admin endpoint (and stop any prior one)
-	if start {
-		err = replaceLocalAdminServer(newCfg)
+	if replaceAdminServer {
+		err = replaceLocalAdminServer(newCfg, ctx)
 		if err != nil {
 			return ctx, fmt.Errorf("starting caddy administration endpoint: %v", err)
 		}
 	}
+
+	// create the new filesystem map
+	newCfg.filesystems = &filesystems.FilesystemMap{}
 
 	// prepare the new config for use
 	newCfg.apps = make(map[string]App)
@@ -480,49 +548,16 @@ func run(newCfg *Config, start bool) (Context, error) {
 		}
 		return nil
 	}()
-	if err != nil {
-		return ctx, err
-	}
+	return ctx, err
+}
 
-	if !start {
-		return ctx, nil
-	}
-
-	// Provision any admin routers which may need to access
-	// some of the other apps at runtime
-	err = newCfg.Admin.provisionAdminRouters(ctx)
-	if err != nil {
-		return ctx, err
-	}
-
-	// Start
-	err = func() error {
-		started := make([]string, 0, len(newCfg.apps))
-		for name, a := range newCfg.apps {
-			err := a.Start()
-			if err != nil {
-				// an app failed to start, so we need to stop
-				// all other apps that were already started
-				for _, otherAppName := range started {
-					err2 := newCfg.apps[otherAppName].Stop()
-					if err2 != nil {
-						err = fmt.Errorf("%v; additionally, aborting app %s: %v",
-							err, otherAppName, err2)
-					}
-				}
-				return fmt.Errorf("%s app module: start: %v", name, err)
-			}
-			started = append(started, name)
-		}
-		return nil
-	}()
-	if err != nil {
-		return ctx, err
-	}
-
-	// now that the user's config is running, finish setting up anything else,
-	// such as remote admin endpoint, config loader, etc.
-	return ctx, finishSettingUp(ctx, newCfg)
+// ProvisionContext creates a new context from the configuration and provisions storage
+// and app modules.
+// The function is intended for testing and advanced use cases only, typically `Run` should be
+// use to ensure a fully functional caddy instance.
+// EXPERIMENTAL: While this is public the interface and implementation details of this function may change.
+func ProvisionContext(newCfg *Config) (Context, error) {
+	return provisionContext(newCfg, false)
 }
 
 // finishSettingUp should be run after all apps have successfully started.
@@ -627,22 +662,35 @@ type ConfigLoader interface {
 // stop the others. Stop should only be called
 // if not replacing with a new config.
 func Stop() error {
+	currentCtxMu.RLock()
+	ctx := currentCtx
+	currentCtxMu.RUnlock()
+
+	rawCfgMu.Lock()
+	unsyncedStop(ctx)
+
 	currentCtxMu.Lock()
-	defer currentCtxMu.Unlock()
-	unsyncedStop(currentCtx)
 	currentCtx = Context{}
+	currentCtxMu.Unlock()
+
 	rawCfgJSON = nil
 	rawCfgIndex = nil
 	rawCfg[rawConfigKey] = nil
+	rawCfgMu.Unlock()
+
 	return nil
 }
 
-// unsyncedStop stops cfg from running, but has
-// no locking around cfg. It is a no-op if cfg is
-// nil. If any app returns an error when stopping,
+// unsyncedStop stops ctx from running, but has
+// no locking around ctx. It is a no-op if ctx has a
+// nil cfg. If any app returns an error when stopping,
 // it is logged and the function continues stopping
 // the next app. This function assumes all apps in
-// cfg were successfully started first.
+// ctx were successfully started first.
+//
+// A lock on rawCfgMu is required, even though this
+// function does not access rawCfg, that lock
+// synchronizes the stop/start of apps.
 func unsyncedStop(ctx Context) {
 	if ctx.cfg == nil {
 		return
@@ -677,8 +725,10 @@ func Validate(cfg *Config) error {
 // Errors are logged along the way, and an appropriate exit
 // code is emitted.
 func exitProcess(ctx context.Context, logger *zap.Logger) {
-	// let the rest of the program know we're quitting
-	atomic.StoreInt32(exiting, 1)
+	// let the rest of the program know we're quitting; only do it once
+	if !atomic.CompareAndSwapInt32(exiting, 0, 1) {
+		return
+	}
 
 	// give the OS or service/process manager our 2 weeks' notice: we quit
 	if err := notify.Stopping(); err != nil {
@@ -691,6 +741,7 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 	logger.Warn("exiting; byeee!! 👋")
 
 	exitCode := ExitCodeSuccess
+	lastContext := ActiveContext()
 
 	// stop all apps
 	if err := Stop(); err != nil {
@@ -711,6 +762,16 @@ func exitProcess(ctx context.Context, logger *zap.Logger) {
 			exitCode = ExitCodeFailedQuit
 		}
 	}
+
+	// execute any process-exit callbacks
+	for _, exitFunc := range lastContext.exitFuncs {
+		exitFunc(ctx)
+	}
+	exitFuncsMu.Lock()
+	for _, exitFunc := range exitFuncs {
+		exitFunc(ctx)
+	}
+	exitFuncsMu.Unlock()
 
 	// shut down admin endpoint(s) in goroutines so that
 	// if this function was called from an admin handler,
@@ -749,6 +810,23 @@ var exiting = new(int32) // accessed atomically
 // Exiting returns true if the process is exiting.
 // EXPERIMENTAL API: subject to change or removal.
 func Exiting() bool { return atomic.LoadInt32(exiting) == 1 }
+
+// OnExit registers a callback to invoke during process exit.
+// This registration is PROCESS-GLOBAL, meaning that each
+// function should only be registered once forever, NOT once
+// per config load (etc).
+//
+// EXPERIMENTAL API: subject to change or removal.
+func OnExit(f func(context.Context)) {
+	exitFuncsMu.Lock()
+	exitFuncs = append(exitFuncs, f)
+	exitFuncsMu.Unlock()
+}
+
+var (
+	exitFuncs   []func(context.Context)
+	exitFuncsMu sync.Mutex
+)
 
 // Duration can be an integer or a string. An integer is
 // interpreted as nanoseconds. If a string, it is a Go
@@ -809,14 +887,19 @@ func ParseDuration(s string) (time.Duration, error) {
 // regardless of storage configuration, since each instance is intended to
 // have its own unique ID.
 func InstanceID() (uuid.UUID, error) {
-	uuidFilePath := filepath.Join(AppDataDir(), "instance.uuid")
+	appDataDir := AppDataDir()
+	uuidFilePath := filepath.Join(appDataDir, "instance.uuid")
 	uuidFileBytes, err := os.ReadFile(uuidFilePath)
-	if os.IsNotExist(err) {
+	if errors.Is(err, fs.ErrNotExist) {
 		uuid, err := uuid.NewRandom()
 		if err != nil {
 			return uuid, err
 		}
-		err = os.WriteFile(uuidFilePath, []byte(uuid.String()), 0600)
+		err = os.MkdirAll(appDataDir, 0o700)
+		if err != nil {
+			return uuid, err
+		}
+		err = os.WriteFile(uuidFilePath, []byte(uuid.String()), 0o600)
 		return uuid, err
 	} else if err != nil {
 		return [16]byte{}, err
@@ -969,14 +1052,12 @@ type CtxKey string
 
 // This group of variables pertains to the current configuration.
 var (
-	// currentCtxMu protects everything in this var block.
-	currentCtxMu sync.RWMutex
-
 	// currentCtx is the root context for the currently-running
 	// configuration, which can be accessed through this value.
 	// If the Config contained in this value is not nil, then
 	// a config is currently active/running.
-	currentCtx Context
+	currentCtx   Context
+	currentCtxMu sync.RWMutex
 
 	// rawCfg is the current, generic-decoded configuration;
 	// we initialize it as a map with one field ("config")
@@ -994,6 +1075,10 @@ var (
 	// rawCfgIndex is the map of user-assigned ID to expanded
 	// path, for converting /id/ paths to /config/ paths.
 	rawCfgIndex map[string]string
+
+	// rawCfgMu protects all the rawCfg fields and also
+	// essentially synchronizes config changes/reloads.
+	rawCfgMu sync.RWMutex
 )
 
 // errSameConfig is returned if the new config is the same

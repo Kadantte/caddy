@@ -150,6 +150,24 @@ func TestParseUpstreamDialAddress(t *testing.T) {
 			expectScheme:   "h2c",
 		},
 		{
+			input:          "localhost:1001-1009",
+			expectHostPort: "localhost:1001-1009",
+		},
+		{
+			input:          "{host}:1001-1009",
+			expectHostPort: "{host}:1001-1009",
+		},
+		{
+			input:          "http://localhost:1001-1009",
+			expectHostPort: "localhost:1001-1009",
+			expectScheme:   "http",
+		},
+		{
+			input:          "https://localhost:1001-1009",
+			expectHostPort: "localhost:1001-1009",
+			expectScheme:   "https",
+		},
+		{
 			input:          "unix//var/php.sock",
 			expectHostPort: "unix//var/php.sock",
 		},
@@ -197,6 +215,26 @@ func TestParseUpstreamDialAddress(t *testing.T) {
 			expectErr: true,
 		},
 		{
+			input:     "http://localhost:8001-8002-8003",
+			expectErr: true,
+		},
+		{
+			input:     "http://localhost:8001-8002/foo:bar",
+			expectErr: true,
+		},
+		{
+			input:     "http://localhost:8001-8002/foo:1",
+			expectErr: true,
+		},
+		{
+			input:     "http://localhost:8001-8002/foo:1-2",
+			expectErr: true,
+		},
+		{
+			input:     "http://localhost:8001-8002#foo:1",
+			expectErr: true,
+		},
+		{
 			input:     "http://foo:443",
 			expectErr: true,
 		},
@@ -227,18 +265,18 @@ func TestParseUpstreamDialAddress(t *testing.T) {
 			expectScheme:   "h2c",
 		},
 	} {
-		actualHostPort, actualScheme, err := parseUpstreamDialAddress(tc.input)
+		actualAddr, err := parseUpstreamDialAddress(tc.input)
 		if tc.expectErr && err == nil {
 			t.Errorf("Test %d: Expected error but got %v", i, err)
 		}
 		if !tc.expectErr && err != nil {
 			t.Errorf("Test %d: Expected no error but got %v", i, err)
 		}
-		if actualHostPort != tc.expectHostPort {
-			t.Errorf("Test %d: Expected host and port '%s' but got '%s'", i, tc.expectHostPort, actualHostPort)
+		if actualAddr.dialAddr() != tc.expectHostPort {
+			t.Errorf("Test %d: input %s: Expected host and port '%s' but got '%s'", i, tc.input, tc.expectHostPort, actualAddr.dialAddr())
 		}
-		if actualScheme != tc.expectScheme {
-			t.Errorf("Test %d: Expected scheme '%s' but got '%s'", i, tc.expectScheme, actualScheme)
+		if actualAddr.scheme != tc.expectScheme {
+			t.Errorf("Test %d: Expected scheme '%s' but got '%s'", i, tc.expectScheme, actualAddr.scheme)
 		}
 	}
 }

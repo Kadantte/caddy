@@ -5,8 +5,6 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/caddyserver/caddy/v2"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/contrib/propagators/autoprop"
 	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
@@ -14,7 +12,11 @@ import (
 	"go.opentelemetry.io/otel/sdk/resource"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	semconv "go.opentelemetry.io/otel/semconv/v1.17.0"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
+
+	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 )
 
 const (
@@ -81,8 +83,23 @@ func newOpenTelemetryWrapper(
 
 // serveHTTP injects a tracing context and call the next handler.
 func (ot *openTelemetryWrapper) serveHTTP(w http.ResponseWriter, r *http.Request) {
-	ot.propagators.Inject(r.Context(), propagation.HeaderCarrier(r.Header))
-	next := r.Context().Value(nextCallCtxKey).(*nextCall)
+	ctx := r.Context()
+	ot.propagators.Inject(ctx, propagation.HeaderCarrier(r.Header))
+	spanCtx := trace.SpanContextFromContext(ctx)
+	if spanCtx.IsValid() {
+		traceID := spanCtx.TraceID().String()
+		spanID := spanCtx.SpanID().String()
+		// Add a trace_id placeholder, accessible via `{http.vars.trace_id}`.
+		caddyhttp.SetVar(ctx, "trace_id", traceID)
+		// Add a span_id placeholder, accessible via `{http.vars.span_id}`.
+		caddyhttp.SetVar(ctx, "span_id", spanID)
+		// Add the traceID and spanID to the log fields for the request.
+		if extra, ok := ctx.Value(caddyhttp.ExtraLogFieldsCtxKey).(*caddyhttp.ExtraLogFields); ok {
+			extra.Add(zap.String("traceID", traceID))
+			extra.Add(zap.String("spanID", spanID))
+		}
+	}
+	next := ctx.Value(nextCallCtxKey).(*nextCall)
 	next.err = next.next.ServeHTTP(w, r)
 }
 
