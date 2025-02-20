@@ -10,14 +10,16 @@ jobs:
     name: Release
     strategy:
       matrix:
-        os: [ ubuntu-latest ]
-        go: [ '1.20' ]
+        os: 
+          - ubuntu-latest
+        go: 
+          - '1.24'
 
         include:
         # Set the minimum Go patch version for the given Go minor
         # Usable via ${{ matrix.GO_SEMVER }}
-        - go: '1.20'
-          GO_SEMVER: '~1.20.1'
+        - go: '1.24'
+          GO_SEMVER: '~1.24.0'
 
     runs-on: ${{ matrix.os }}
     # https://github.com/sigstore/cosign/issues/1258#issuecomment-1002251233
@@ -29,19 +31,19 @@ jobs:
       contents: write
 
     steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
     - name: Install Go
-      uses: actions/setup-go@v3
+      uses: actions/setup-go@v5
       with:
         go-version: ${{ matrix.GO_SEMVER }}
         check-latest: true
 
-    - name: Checkout code
-      uses: actions/checkout@v3
-      with:
-        fetch-depth: 0
-
     # Force fetch upstream tags -- because 65 minutes
-    # tl;dr: actions/checkout@v3 runs this line:
+    # tl;dr: actions/checkout@v4 runs this line:
     #   git -c protocol.version=2 fetch --no-tags --prune --progress --no-recurse-submodules --depth=1 origin +ebc278ec98bb24f2852b61fde2a9bf2e3d83818b:refs/tags/
     # which makes its own local lightweight tag, losing all the annotations in the process. Our earlier script ran:
     #   git fetch --prune --unshallow
@@ -94,18 +96,6 @@ jobs:
         # tags are only accepted if signed by Matt's key
         git verify-tag "${{ steps.vars.outputs.version_tag }}" || exit 1
 
-    - name: Cache the build cache
-      uses: actions/cache@v3
-      with:
-        # In order:
-        # * Module download cache
-        # * Build cache (Linux)
-        path: |
-          ~/go/pkg/mod
-          ~/.cache/go-build
-        key: ${{ runner.os }}-go${{ matrix.go }}-release-${{ hashFiles('**/go.sum') }}
-        restore-keys: |
-          ${{ runner.os }}-go${{ matrix.go }}-release
     - name: Install Cosign
       uses: sigstore/cosign-installer@main
     - name: Cosign version
@@ -114,12 +104,16 @@ jobs:
       uses: anchore/sbom-action/download-syft@main
     - name: Syft version
       run: syft version
+    - name: Install xcaddy
+      run: |
+        go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+        xcaddy version
     # GoReleaser will take care of publishing those artifacts into the release
     - name: Run GoReleaser
-      uses: goreleaser/goreleaser-action@v4
+      uses: goreleaser/goreleaser-action@v6
       with:
         version: latest
-        args: release --rm-dist --timeout 60m
+        args: release --clean --timeout 60m
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         TAG: ${{ steps.vars.outputs.version_tag }}

@@ -24,13 +24,13 @@ import (
 	"strings"
 	"time"
 
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
-	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
-	"github.com/caddyserver/caddy/v2/modules/caddytls"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp/reverseproxy"
+	"github.com/caddyserver/caddy/v2/modules/caddytls"
 )
 
 var noopLogger = zap.NewNop()
@@ -148,10 +148,13 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		zap.Object("request", loggableReq),
 		zap.Object("env", loggableEnv),
 	)
-	logger.Debug("roundtrip",
-		zap.String("dial", address),
-		zap.Object("env", loggableEnv),
-		zap.Object("request", loggableReq))
+	if c := t.logger.Check(zapcore.DebugLevel, "roundtrip"); c != nil {
+		c.Write(
+			zap.String("dial", address),
+			zap.Object("env", loggableEnv),
+			zap.Object("request", loggableReq),
+		)
+	}
 
 	// connect to the backend
 	dialer := net.Dialer{Timeout: time.Duration(t.DialTimeout)}
@@ -171,6 +174,7 @@ func (t Transport) RoundTrip(r *http.Request) (*http.Response, error) {
 		rwc:    conn,
 		reqID:  1,
 		logger: logger,
+		stderr: t.CaptureStderr,
 	}
 
 	// read/write timeouts
@@ -224,7 +228,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	ip = strings.Replace(ip, "]", "", 1)
 
 	// make sure file root is absolute
-	root, err := filepath.Abs(repl.ReplaceAll(t.Root, "."))
+	root, err := caddy.FastAbs(repl.ReplaceAll(t.Root, "."))
 	if err != nil {
 		return nil, err
 	}
@@ -254,9 +258,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 	// if we didn't get a split result here.
 	// See https://github.com/caddyserver/caddy/issues/3718
 	if pathInfo == "" {
-		if remainder, ok := repl.GetString("http.matchers.file.remainder"); ok {
-			pathInfo = remainder
-		}
+		pathInfo, _ = repl.GetString("http.matchers.file.remainder")
 	}
 
 	// SCRIPT_FILENAME is the absolute path of SCRIPT_NAME
@@ -286,10 +288,7 @@ func (t Transport) buildEnv(r *http.Request) (envVars, error) {
 		reqHost = r.Host
 	}
 
-	authUser := ""
-	if val, ok := repl.Get("http.auth.user.id"); ok {
-		authUser = val.(string)
-	}
+	authUser, _ := repl.GetString("http.auth.user.id")
 
 	// Some variables are unused but cleared explicitly to prevent
 	// the parent environment from interfering.

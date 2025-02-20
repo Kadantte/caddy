@@ -21,15 +21,17 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/spf13/cobra"
+	"go.uber.org/zap"
+
+	caddycmd "github.com/caddyserver/caddy/v2/cmd"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
-	caddycmd "github.com/caddyserver/caddy/v2/cmd"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/headers"
 	"github.com/caddyserver/caddy/v2/modules/caddytls"
-	"github.com/spf13/cobra"
-	"go.uber.org/zap"
 )
 
 func init() {
@@ -132,14 +134,14 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 	toAddresses := make([]string, len(to))
 	var toScheme string
 	for i, toLoc := range to {
-		addr, scheme, err := parseUpstreamDialAddress(toLoc)
+		addr, err := parseUpstreamDialAddress(toLoc)
 		if err != nil {
 			return caddy.ExitCodeFailedStartup, fmt.Errorf("invalid upstream address %s: %v", toLoc, err)
 		}
-		if scheme != "" && toScheme == "" {
-			toScheme = scheme
+		if addr.scheme != "" && toScheme == "" {
+			toScheme = addr.scheme
 		}
-		toAddresses[i] = addr
+		toAddresses[i] = addr.dialAddr()
 	}
 
 	// proceed to build the handler and server
@@ -153,9 +155,24 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 
 	upstreamPool := UpstreamPool{}
 	for _, toAddr := range toAddresses {
-		upstreamPool = append(upstreamPool, &Upstream{
-			Dial: toAddr,
-		})
+		parsedAddr, err := caddy.ParseNetworkAddress(toAddr)
+		if err != nil {
+			return caddy.ExitCodeFailedStartup, fmt.Errorf("invalid upstream address %s: %v", toAddr, err)
+		}
+
+		if parsedAddr.StartPort == 0 && parsedAddr.EndPort == 0 {
+			// unix networks don't have ports
+			upstreamPool = append(upstreamPool, &Upstream{
+				Dial: toAddr,
+			})
+		} else {
+			// expand a port range into multiple upstreams
+			for i := parsedAddr.StartPort; i <= parsedAddr.EndPort; i++ {
+				upstreamPool = append(upstreamPool, &Upstream{
+					Dial: caddy.JoinNetworkAddress("", parsedAddr.Host, fmt.Sprint(i)),
+				})
+			}
+		}
 	}
 
 	handler := Handler{
@@ -212,11 +229,13 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 
 	if changeHost {
 		if handler.Headers == nil {
-			handler.Headers = &headers.Handler{
-				Request: &headers.HeaderOps{
-					Set: http.Header{},
-				},
-			}
+			handler.Headers = new(headers.Handler)
+		}
+		if handler.Headers.Request == nil {
+			handler.Headers.Request = new(headers.HeaderOps)
+		}
+		if handler.Headers.Request.Set == nil {
+			handler.Headers.Request.Set = http.Header{}
 		}
 		handler.Headers.Request.Set.Set("Host", "{http.reverse_proxy.upstream.hostport}")
 	}
@@ -269,7 +288,8 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 
 	var false bool
 	cfg := &caddy.Config{
-		Admin: &caddy.AdminConfig{Disabled: true,
+		Admin: &caddy.AdminConfig{
+			Disabled: true,
 			Config: &caddy.ConfigSettings{
 				Persist: &false,
 			},
@@ -290,11 +310,9 @@ func cmdReverseProxy(fs caddycmd.Flags) (int, error) {
 		return caddy.ExitCodeFailedStartup, err
 	}
 
-	for _, to := range toAddresses {
-		fmt.Printf("Caddy proxying %s -> %s\n", fromAddr.String(), to)
-	}
+	caddy.Log().Info("caddy proxying", zap.String("from", fromAddr.String()), zap.Strings("to", toAddresses))
 	if len(toAddresses) > 1 {
-		fmt.Println("Load balancing policy: random")
+		caddy.Log().Info("using default load balancing policy", zap.String("policy", "random"))
 	}
 
 	select {}
